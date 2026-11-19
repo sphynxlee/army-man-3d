@@ -1,0 +1,160 @@
+diff --git a/hy3dgen/shapegen/models/autoencoders/volume_decoders.py b/hy3dgen/shapegen/models/autoencoders/volume_decoders.py
+index d7bfd84..61a3cce 100644
+--- a/hy3dgen/shapegen/models/autoencoders/volume_decoders.py
++++ b/hy3dgen/shapegen/models/autoencoders/volume_decoders.py
+@@ -78,7 +78,8 @@ def extract_near_surface_volume_fn(input_tensor: torch.Tensor, alpha: float):
+ 
+         # 应用切片并恢复维度
+         padded = padded.squeeze(0).squeeze(0)
+-        sliced = padded[slice_dims]
++        # A list of slices is advanced indexing on PyTorch 2.9+ and explodes.
++        sliced = padded[tuple(slice_dims)]
+         return sliced
+ 
+     # 获取各方向邻居（确保维度一致）
+diff --git a/hy3dgen/shapegen/models/denoisers/hunyuandit.py b/hy3dgen/shapegen/models/denoisers/hunyuandit.py
+index 42481ea..0925391 100644
+--- a/hy3dgen/shapegen/models/denoisers/hunyuandit.py
++++ b/hy3dgen/shapegen/models/denoisers/hunyuandit.py
+@@ -15,9 +15,25 @@
+ import math
+ 
+ import numpy as np
++import contextlib
++
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
++
++
++@contextlib.contextmanager
++def sdp_context():
++    """CUDA SDP kernel hints are unavailable on Apple Silicon."""
++    if torch.cuda.is_available():
++        with torch.backends.cuda.sdp_kernel(
++            enable_flash=True,
++            enable_math=False,
++            enable_mem_efficient=True,
++        ):
++            yield
++    else:
++        yield
+ from einops import rearrange
+ 
+ from .moe_layers import MoEBlock
+@@ -199,22 +215,14 @@ class CrossAttention(nn.Module):
+         q = self.q_norm(q)
+         k = self.k_norm(k)
+ 
+-        with torch.backends.cuda.sdp_kernel(
+-            enable_flash=True,
+-            enable_math=False,
+-            enable_mem_efficient=True
+-        ):
++        with sdp_context():
+             q, k, v = map(lambda t: rearrange(t, 'b n h d -> b h n d', h=self.num_heads), (q, k, v))
+             context = F.scaled_dot_product_attention(
+                 q, k, v
+             ).transpose(1, 2).reshape(b, s1, -1)
+ 
+         if self.with_dca:
+-            with torch.backends.cuda.sdp_kernel(
+-                enable_flash=True,
+-                enable_math=False,
+-                enable_mem_efficient=True
+-            ):
++            with sdp_context():
+                 k_dca, v_dca = map(lambda t: rearrange(t, 'b n h d -> b h n d', h=self.num_heads),
+                                    (k_dca, v_dca))
+                 context_dca = F.scaled_dot_product_attention(
+@@ -276,11 +284,7 @@ class Attention(nn.Module):
+         q = self.q_norm(q)  # [b, h, s, d]
+         k = self.k_norm(k)  # [b, h, s, d]
+ 
+-        with torch.backends.cuda.sdp_kernel(
+-            enable_flash=True,
+-            enable_math=False,
+-            enable_mem_efficient=True
+-        ):
++        with sdp_context():
+             x = F.scaled_dot_product_attention(q, k, v)
+             x = x.transpose(1, 2).reshape(B, N, -1)
+ 
+diff --git a/hy3dgen/shapegen/pipelines.py b/hy3dgen/shapegen/pipelines.py
+index fc8acc6..6ae97c9 100755
+--- a/hy3dgen/shapegen/pipelines.py
++++ b/hy3dgen/shapegen/pipelines.py
+@@ -32,6 +32,25 @@ from .models.autoencoders import SurfaceExtractors
+ from .utils import logger, synchronize_timer, smart_load_model
+ 
+ 
++def _remap_dinov2_keys(state):
++    """Map the 2025 DINOv2 checkpoint names onto transformers 5 modules."""
++    remapped = {}
++    for key, value in state.items():
++        if ".mlp.weights_in." in key:
++            half = value.shape[0] // 2
++            prefix, suffix = key.split(".mlp.weights_in.")
++            remapped[f"{prefix}.mlp.gate_proj.{suffix}"] = value[:half].contiguous()
++            remapped[f"{prefix}.mlp.up_proj.{suffix}"] = value[half:].contiguous()
++            continue
++        key = key.replace(".mlp.weights_out.", ".mlp.down_proj.")
++        key = key.replace(".attention.attention.query.", ".attention.q_proj.")
++        key = key.replace(".attention.attention.key.", ".attention.k_proj.")
++        key = key.replace(".attention.attention.value.", ".attention.v_proj.")
++        key = key.replace(".attention.output.dense.", ".attention.o_proj.")
++        remapped[key] = value
++    return remapped
++
++
+ def retrieve_timesteps(
+     scheduler,
+     num_inference_steps: Optional[int] = None,
+@@ -168,6 +187,8 @@ class Hunyuan3DDiTPipeline:
+                 new_key = key[len(model_name) + 1:]
+                 if model_name not in ckpt:
+                     ckpt[model_name] = {}
++                if torch.is_tensor(value) and value.is_floating_point():
++                    value = value.to(dtype=dtype)
+                 ckpt[model_name][new_key] = value
+         else:
+             ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+@@ -178,7 +199,7 @@ class Hunyuan3DDiTPipeline:
+         vae.load_state_dict(ckpt['vae'], strict=False)
+         conditioner = instantiate_from_config(config['conditioner'])
+         if 'conditioner' in ckpt:
+-            conditioner.load_state_dict(ckpt['conditioner'])
++            conditioner.load_state_dict(_remap_dinov2_keys(ckpt['conditioner']))
+         image_processor = instantiate_from_config(config['image_processor'])
+         scheduler = instantiate_from_config(config['scheduler'])
+ 
+@@ -762,6 +783,15 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
+                     step_idx = i // getattr(self.scheduler, "order", 1)
+                     callback(step_idx, t, outputs)
+ 
++        # The DiT and image encoder are finished. Drop them before the
++        # octree decode, which needs the freed unified memory on a 32 GB Mac.
++        import gc
++        self.model = None
++        self.conditioner = None
++        gc.collect()
++        if torch.backends.mps.is_available():
++            torch.mps.empty_cache()
++
+         return self._export(
+             latents,
+             output_type,
+diff --git a/hy3dgen/shapegen/schedulers.py b/hy3dgen/shapegen/schedulers.py
+index 13f0da8..cd76d4d 100755
+--- a/hy3dgen/shapegen/schedulers.py
++++ b/hy3dgen/shapegen/schedulers.py
+@@ -403,7 +403,8 @@ class ConsistencyFlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
+ 
+         self.sigmas_ = self.sigmas[inference_indices]
+         timesteps = self.sigmas_ * self.config.num_train_timesteps
+-        self.timesteps = timesteps.to(device=device)
++        # MPS has no float64 kernels; the scheduler builds these in float64.
++        self.timesteps = timesteps.to(device=device, dtype=torch.float32)
+         self.sigmas_ = torch.cat(
+             [self.sigmas_, torch.ones(1, device=self.sigmas_.device)]
+         )
